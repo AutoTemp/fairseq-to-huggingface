@@ -1341,8 +1341,13 @@ class SinusoidalPositionalEmbedding(nn.Embedding):
     """This module produces sinusoidal positional embeddings of any length."""
 
     def __init__(self, num_positions, embedding_dim, padding_idx=None):
-        super().__init__(num_positions, embedding_dim)
-        self.weight = self._init_weight(self.weight)
+        assert padding_idx is not None
+        num_positions += padding_idx + 1
+        super().__init__(num_positions, embedding_dim, padding_idx=padding_idx)
+        if embedding_dim % 2 != 0:
+            raise NotImplementedError(f"odd embedding_dim {embedding_dim} not supported")
+        # self.weight = self._init_weight(self.weight)
+        self.weight = self._fairseq_init_weight(self.weight)
 
     @staticmethod
     def _init_weight(out: nn.Parameter):
@@ -1361,13 +1366,50 @@ class SinusoidalPositionalEmbedding(nn.Embedding):
         out.detach_()
         return out
 
+    def _fairseq_init_weight(self, out: nn.Parameter):
+        num_embeddings, embedding_dim = out.shape
+        half_dim = embedding_dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, dtype=torch.float) * -emb)
+        emb = torch.arange(num_embeddings, dtype=torch.float).unsqueeze(
+            1
+        ) * emb.unsqueeze(0)
+        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1).view(
+            num_embeddings, -1
+        )
+        if embedding_dim % 2 == 1:
+            # zero pad
+            emb = torch.cat([emb, torch.zeros(num_embeddings, 1)], dim=1)
+        if self.padding_idx is not None:
+            emb[self.padding_idx, :] = 0
+        out[:] = emb
+        out.detach_()
+        out.requires_grad = False
+        return out
+
+
     @torch.no_grad()
     def forward(self, input_ids, use_cache=False):
         """Input is expected to be of size [bsz x seqlen]."""
         bsz, seq_len = input_ids.shape[:2]
         if use_cache:
-            positions = input_ids.data.new(1, 1).fill_(seq_len - 1)  # called before slicing
+            pos = int(self.padding_idx + seq_len)
+            positions = input_ids.data.new(1, 1).fill_(pos)
+            # positions = input_ids.data.new(1, 1).fill_(seq_len - 1)  # called before slicing
         else:
             # starts at 0, ends at 1-seq_len
-            positions = torch.arange(seq_len, dtype=torch.long, device=self.weight.device)
+            # positions = torch.arange(seq_len, dtype=torch.long, device=self.weight.device)
+            positions = create_position_ids_from_input_ids(input_ids, self.padding_idx)
         return super().forward(positions)
+
+def create_position_ids_from_input_ids(input_ids, padding_idx):
+    """ Replace non-padding symbols with their position numbers. Position numbers begin at
+    padding_idx+1. Padding symbols are ignored. This is modified from fairseq's
+    `utils.make_positions`.
+    :param torch.Tensor x:
+    :return torch.Tensor:
+    """
+    # The series of casts and type-conversions here are carefully balanced to both work with ONNX export and XLA.
+    mask = input_ids.ne(padding_idx).int()
+    incremental_indices = torch.cumsum(mask, dim=1).type_as(mask) * mask
+    return incremental_indices.long() + padding_idx
